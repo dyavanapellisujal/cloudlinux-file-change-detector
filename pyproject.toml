@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "challenge-fixtures"
+version = "0.1.0"
+description = "Candidate fixtures for the CloudLinux Engineering Discovery Challenge (real-time file-change detection)."
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+# pip path (native Linux): puts the three fixtures on PATH. The unified `challenge` dispatcher
+# is provided by the Docker image; these are the per-tool entry points.
+challenge-seed = "seed_generator.seed_generator:main"
+challenge-scanner = "scanner_stub.scanner_stub:main"
+challenge-load = "change_load_generator.load_generator:main"
+
+[tool.setuptools]
+# Candidate-facing tools ONLY. The reviewer scorecard and orchestrator are intentionally excluded.
+packages = ["seed_generator", "scanner_stub", "change_load_generator"]

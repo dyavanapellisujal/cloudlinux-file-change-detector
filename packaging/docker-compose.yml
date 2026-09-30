@@ -1,0 +1,35 @@
+# Candidate convenience stack. Brings up a seeded tree + the scanner stub on a shared ./work
+# volume, so you can point YOUR detector (on the host or in your own container) at:
+#   - the account tree:   ./work/home
+#   - the scanner socket:  ./work/run/scanner/intake.sock
+#
+# Usage:
+#   docker compose -f packaging/docker-compose.yml up seed        # one-shot: lay down the tree
+#   docker compose -f packaging/docker-compose.yml up -d scanner  # run the scanning service
+#   docker compose -f packaging/docker-compose.yml run --rm load --scenario steady --duration 60
+#
+# `--privileged` is set so a containerised detector approach has kernel access; drop it if you
+# run your detector on the host.
+services:
+  seed:
+    build: { context: .., dockerfile: packaging/Dockerfile }
+    image: challenge-fixtures
+    privileged: true
+    volumes: ["./work:/work"]
+    command: ["seed", "--root", "/work/home", "--accounts", "10", "--files-per-account", "800", "--seed", "0"]
+
+  scanner:
+    image: challenge-fixtures
+    privileged: true
+    volumes: ["./work:/work"]
+    command: ["scanner", "--socket", "/work/run/scanner/intake.sock", "--rate", "200"]
+    restart: unless-stopped
+
+  # On-demand workload driver (no oracle — reviewer-only).
+  load:
+    image: challenge-fixtures
+    privileged: true
+    volumes: ["./work:/work"]
+    # NOTE: needs a seed manifest; generate with `challenge seed ... --manifest /work/seed.json`
+    command: ["load", "--manifest", "/work/seed.json", "--scenario", "steady", "--duration", "60"]
+    profiles: ["manual"]
