@@ -31,8 +31,7 @@ To drive it by hand and **watch scans stream live**, follow
 
 | Doc | What's in it |
 | :-- | :-- |
-| **[DESIGN.md](DESIGN.md)** | Full architecture, exact flows, and **Mermaid diagrams** for every scenario + the rationale |
-| **[RATIONALE.md](RATIONALE.md)** | The Phase-2 submission note (trade-off, self-objection, AI attribution) |
+| **[DESIGN.md](DESIGN.md)** | Full architecture, exact flows, and **Mermaid diagrams** for every scenario |
 | **[TESTING.md](TESTING.md)** | Build → exec in → run fixtures → watch detections live |
 | **[detector/](detector/)** | The component (6 modules + `run.sh`) |
 
@@ -48,7 +47,6 @@ To drive it by hand and **watch scans stream live**, follow
 - [Detector crash — SQLite recovery](DESIGN.md#8-detector-crash--sqlite-recovery-the-durability-net)
 - [Burst handling & kernel-overflow protection](DESIGN.md#9-burst-handling--kernel-overflow-protection)
 - [Failure matrix](DESIGN.md#10-failure-matrix) — every failure → how it's handled
-- [The central trade-off](DESIGN.md#11-the-central-trade-off) — never-lose vs bounded resources, + self-objection + AI attribution
 - [Requirements mapping](DESIGN.md#12-requirements-mapping)
 - [Known limits / future work](DESIGN.md#13-known-limits--future-work)
 
@@ -81,10 +79,6 @@ flowchart LR
 4. **Deliver** — submit over the UNIX socket; on `busy` back off (50ms→1s) and
    retry; on disconnect reconnect and replay; persist undelivered jobs to **SQLite**
    so nothing is lost across a scanner outage **or a detector crash**.
-
-**Central trade-off:** chose **never-lose** over strictly-bounded resources —
-missing the one malicious file is the worst outcome. Full reasoning + the
-strongest objection to this choice: [DESIGN.md §11](DESIGN.md#11-the-central-trade-off).
 
 ---
 
