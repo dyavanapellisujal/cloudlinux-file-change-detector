@@ -23,36 +23,38 @@ def _log(msg: str) -> None:
 
 
 class PollWatcher:
-    def __init__(self, root: str, callback, stop_event, interval: float = 1.0):
-        self.root = root
+    def __init__(self, roots, callback, stop_event, interval: float = 1.0):
+        # `roots` is one path or a list of paths (same as the fanotify watcher).
+        self.roots = [roots] if isinstance(roots, str) else list(roots)
         self.callback = callback      # callback(path, reason, size, mtime_ns, is_exec)
         self.stop = stop_event
         self.interval = interval
 
     def run(self) -> None:
-        _log(f"polling {self.root} every {self.interval}s (fanotify unavailable)")
+        _log(f"polling {', '.join(self.roots)} every {self.interval}s (fanotify unavailable)")
         baseline = {}                 # path -> signature
         first_pass = True             # record the existing tree silently, don't scan it
         while not self.stop.is_set():
             seen = set()
-            for dirpath, _dirs, files in os.walk(self.root):
-                for name in files:
-                    path = os.path.join(dirpath, name)
-                    try:
-                        st = os.stat(path)
-                    except OSError:
-                        continue
-                    if not stat.S_ISREG(st.st_mode):
-                        continue
-                    seen.add(path)
-                    is_exec = bool(st.st_mode & 0o111)
-                    sig = (st.st_size, st.st_mtime_ns, is_exec)
-                    old = baseline.get(path)
-                    if old != sig:
-                        baseline[path] = sig
-                        if not first_pass:
-                            reason = "created" if old is None else "modified"
-                            self.callback(path, reason, st.st_size, st.st_mtime_ns, is_exec)
+            for root in self.roots:
+                for dirpath, _dirs, files in os.walk(root):
+                    for name in files:
+                        path = os.path.join(dirpath, name)
+                        try:
+                            st = os.stat(path)
+                        except OSError:
+                            continue
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        seen.add(path)
+                        is_exec = bool(st.st_mode & 0o111)
+                        sig = (st.st_size, st.st_mtime_ns, is_exec)
+                        old = baseline.get(path)
+                        if old != sig:
+                            baseline[path] = sig
+                            if not first_pass:
+                                reason = "created" if old is None else "modified"
+                                self.callback(path, reason, st.st_size, st.st_mtime_ns, is_exec)
             for gone in set(baseline) - seen:   # forget deleted files
                 del baseline[gone]
             first_pass = False

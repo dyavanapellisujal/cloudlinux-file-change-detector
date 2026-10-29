@@ -13,8 +13,7 @@ steps build a small image, let you `exec` into it, run the **provided** fixtures
 - Run all `docker build` / `docker run` commands from the **repo root**.
 
 ## 1. Build the image
-No apt packages, so this is quick and won't hit the memory issue the full
-`packaging/Dockerfile` can:
+
 ```bash
 docker build -f test/Dockerfile -t detector-test .
 docker volume create cl_work          # ext4 volume for the tree + socket (fanotify-friendly)

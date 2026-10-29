@@ -1,37 +1,17 @@
-diff --git a/detector/__pycache__/detector.cpython-313.pyc b/detector/__pycache__/detector.cpython-313.pyc
+diff --git a/detector/.gitignore b/detector/.gitignore
 new file mode 100644
-index 0000000..6741b12
-Binary files /dev/null and b/detector/__pycache__/detector.cpython-313.pyc differ
-diff --git a/detector/__pycache__/fanotify.cpython-313.pyc b/detector/__pycache__/fanotify.cpython-313.pyc
-new file mode 100644
-index 0000000..526e5d8
-Binary files /dev/null and b/detector/__pycache__/fanotify.cpython-313.pyc differ
-diff --git a/detector/__pycache__/poll_watcher.cpython-313.pyc b/detector/__pycache__/poll_watcher.cpython-313.pyc
-new file mode 100644
-index 0000000..d9feb27
-Binary files /dev/null and b/detector/__pycache__/poll_watcher.cpython-313.pyc differ
-diff --git a/detector/__pycache__/scanner_client.cpython-313.pyc b/detector/__pycache__/scanner_client.cpython-313.pyc
-new file mode 100644
-index 0000000..d8826fd
-Binary files /dev/null and b/detector/__pycache__/scanner_client.cpython-313.pyc differ
-diff --git a/detector/__pycache__/watchset.cpython-313.pyc b/detector/__pycache__/watchset.cpython-313.pyc
-new file mode 100644
-index 0000000..9cc0693
-Binary files /dev/null and b/detector/__pycache__/watchset.cpython-313.pyc differ
-diff --git a/detector/__pycache__/work_queue.cpython-313.pyc b/detector/__pycache__/work_queue.cpython-313.pyc
-new file mode 100644
-index 0000000..9ec2186
-Binary files /dev/null and b/detector/__pycache__/work_queue.cpython-313.pyc differ
-diff --git a/detector/__pycache__/workqueue.cpython-313.pyc b/detector/__pycache__/workqueue.cpython-313.pyc
-new file mode 100644
-index 0000000..1908e15
-Binary files /dev/null and b/detector/__pycache__/workqueue.cpython-313.pyc differ
+index 0000000..7a60b85
+--- /dev/null
++++ b/detector/.gitignore
+@@ -0,0 +1,2 @@
++__pycache__/
++*.pyc
 diff --git a/detector/detector.py b/detector/detector.py
 new file mode 100644
-index 0000000..9487d23
+index 0000000..be9a14a
 --- /dev/null
 +++ b/detector/detector.py
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,139 @@
 +#!/usr/bin/env python3
 +"""
 +detector.py — entry point that wires the pieces together.
@@ -92,17 +72,17 @@ index 0000000..9487d23
 +# --------------------------------------------------------------------------- #
 +#  Wiring
 +# --------------------------------------------------------------------------- #
-+def make_watcher(seed_tree, on_change, stop):
++def make_watcher(roots, on_change, stop):
 +    """fanotify on Linux if we can set it up; otherwise the polling fallback."""
 +    if sys.platform.startswith("linux"):
 +        try:
 +            from fanotify_watcher import FanotifyWatcher
-+            return FanotifyWatcher(seed_tree, on_change, stop)
++            return FanotifyWatcher(roots, on_change, stop)
 +        except Exception as e:                # not root, old kernel, etc.
 +            print(f"[detector] fanotify unavailable ({e}); using polling fallback",
 +                  file=sys.stderr, flush=True)
 +    from poll_watcher import PollWatcher
-+    return PollWatcher(seed_tree, on_change, stop)
++    return PollWatcher(roots, on_change, stop)
 +
 +
 +def main() -> int:
@@ -111,6 +91,13 @@ index 0000000..9487d23
 +    if not seed_tree or not socket_path:
 +        print("SEED_TREE and SCANNER_SOCKET must be set", file=sys.stderr)
 +        return 2
++
++    # Watch one tree by default (SEED_TREE), or several filesystems/disks via
++    # WATCH_ROOTS="/home,/var/www,/data" — one fanotify mark per filesystem,
++    # all feeding this one detector. See DESIGN.md "Monitoring multiple disks".
++    roots = [r.strip() for r in os.environ.get("WATCH_ROOTS", "").split(",") if r.strip()]
++    if not roots:
++        roots = [seed_tree]
 +
 +    # Durable queue so a detector restart doesn't drop a backlog. Override the
 +    # location with DETECTOR_DB; set it empty to run purely in-memory.
@@ -129,7 +116,7 @@ index 0000000..9487d23
 +            queue.offer(Job(path, reason, size, mtime_ns, is_exec, time.time()))
 +
 +    verbose = os.environ.get("DETECTOR_VERBOSE", "") not in ("", "0", "false")
-+    watcher = make_watcher(seed_tree, on_change, stop)
++    watcher = make_watcher(roots, on_change, stop)
 +    client = ScannerClient(socket_path, queue, stop, verbose=verbose)
 +
 +    def shutdown(*_):
@@ -164,231 +151,12 @@ index 0000000..9487d23
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
-diff --git a/detector/fanotify.py b/detector/fanotify.py
-new file mode 100644
-index 0000000..f85e6ea
---- /dev/null
-+++ b/detector/fanotify.py
-@@ -0,0 +1,213 @@
-+"""
-+fanotify.py — the kernel watcher (Linux only).
-+
-+We place ONE filesystem-wide fanotify mark over the watched tree and let the
-+kernel tap us on every relevant event. This scales to millions of files and new
-+directories are covered automatically — unlike inotify, which needs a watch per
-+directory and would exhaust max_user_watches on a real fleet.
-+
-+We use the modern FID reporting mode (FAN_REPORT_DFID_NAME, Linux 5.9+) so that
-+directory-entry events (CREATE / MOVED_TO) are reported with a directory file
-+handle + name. We turn a handle back into a path with open_by_handle_at(2) +
-+readlink(/proc/self/fd/N). FAN_UNLIMITED_QUEUE removes the default event cap so a
-+50k burst does not overflow the kernel queue and silently lose changes.
-+
-+Implemented with ctypes against glibc so the detector stays self-contained (no
-+pip install on the grader). Requires CAP_SYS_ADMIN (run as root).
-+"""
-+from __future__ import annotations
-+
-+import ctypes
-+import os
-+import select
-+import struct
-+
-+libc = ctypes.CDLL("libc.so.6", use_errno=True)
-+
-+# ---- fanotify_init flags ------------------------------------------------- #
-+FAN_CLOEXEC          = 0x00000001
-+FAN_NONBLOCK         = 0x00000002
-+FAN_CLASS_NOTIF      = 0x00000000
-+FAN_UNLIMITED_QUEUE  = 0x00000010
-+FAN_UNLIMITED_MARKS  = 0x00000020
-+FAN_REPORT_DIR_FID   = 0x00000400
-+FAN_REPORT_NAME      = 0x00000800
-+FAN_REPORT_DFID_NAME = FAN_REPORT_DIR_FID | FAN_REPORT_NAME
-+
-+# ---- fanotify_mark flags ------------------------------------------------- #
-+FAN_MARK_ADD         = 0x00000001
-+FAN_MARK_FILESYSTEM  = 0x00000100
-+
-+# ---- event mask bits ----------------------------------------------------- #
-+FAN_MODIFY       = 0x00000002
-+FAN_ATTRIB       = 0x00000004
-+FAN_CLOSE_WRITE  = 0x00000008
-+FAN_MOVED_TO     = 0x00000080
-+FAN_CREATE       = 0x00000100
-+FAN_ONDIR        = 0x40000000
-+FAN_Q_OVERFLOW   = 0x00004000
-+
-+WATCH_MASK = FAN_CREATE | FAN_CLOSE_WRITE | FAN_MOVED_TO | FAN_ATTRIB
-+
-+# ---- misc syscall constants --------------------------------------------- #
-+AT_FDCWD = -100
-+O_PATH   = 0o10000000
-+O_RDONLY = 0o0
-+
-+# ---- info record types (struct fanotify_event_info_header.info_type) ----- #
-+FAN_EVENT_INFO_TYPE_FID       = 1
-+FAN_EVENT_INFO_TYPE_DFID_NAME = 2
-+FAN_EVENT_INFO_TYPE_DFID      = 3
-+
-+# struct fanotify_event_metadata: event_len,u8 vers,u8 res,u16 meta_len,u64 mask,s32 fd,s32 pid
-+_META = struct.Struct("<IBBHQii")
-+_META_LEN = _META.size            # 24
-+_FANOTIFY_METADATA_VERSION = 3
-+
-+libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
-+libc.fanotify_init.restype = ctypes.c_int
-+libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint64,
-+                               ctypes.c_int, ctypes.c_char_p]
-+libc.fanotify_mark.restype = ctypes.c_int
-+libc.open_by_handle_at.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
-+libc.open_by_handle_at.restype = ctypes.c_int
-+
-+
-+def _oserr(msg: str) -> OSError:
-+    e = ctypes.get_errno()
-+    return OSError(e, "%s: %s" % (msg, os.strerror(e)))
-+
-+
-+class FanotifyWatcher:
-+    def __init__(self, root: str):
-+        self.root = root
-+        self.fd = -1
-+        self._mount_fd = -1
-+
-+    def start(self) -> None:
-+        flags = (FAN_CLASS_NOTIF | FAN_REPORT_DFID_NAME |
-+                 FAN_UNLIMITED_QUEUE | FAN_CLOEXEC | FAN_NONBLOCK)
-+        self.fd = libc.fanotify_init(flags, O_RDONLY)
-+        if self.fd < 0:
-+            raise _oserr("fanotify_init")
-+
-+        if libc.fanotify_mark(self.fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-+                              ctypes.c_uint64(WATCH_MASK), AT_FDCWD,
-+                              self.root.encode()) < 0:
-+            raise _oserr("fanotify_mark")
-+
-+        # A reference fd into the same filesystem, so open_by_handle_at can
-+        # resolve handles back to paths.
-+        self._mount_fd = os.open(self.root, O_RDONLY)
-+
-+    def close(self) -> None:
-+        for fd in (self.fd, self._mount_fd):
-+            if fd and fd >= 0:
-+                try:
-+                    os.close(fd)
-+                except OSError:
-+                    pass
-+        self.fd = self._mount_fd = -1
-+
-+    # ---- turn a file handle blob into a path ----------------------------- #
-+    def _path_from_handle(self, handle_blob: bytes):
-+        buf = ctypes.create_string_buffer(handle_blob, len(handle_blob))
-+        fd = libc.open_by_handle_at(self._mount_fd, buf, O_PATH)
-+        if fd < 0:
-+            return None                 # ESTALE etc. (object gone) -> skip
-+        try:
-+            return os.readlink("/proc/self/fd/%d" % fd)
-+        except OSError:
-+            return None
-+        finally:
-+            os.close(fd)
-+
-+    # ---- parse one info record; return ("dir"|"file", handle_blob, name) -- #
-+    @staticmethod
-+    def _parse_info(rec: bytes):
-+        # header: u8 info_type, u8 pad, u16 len
-+        itype = rec[0]
-+        if itype not in (FAN_EVENT_INFO_TYPE_FID,
-+                         FAN_EVENT_INFO_TYPE_DFID,
-+                         FAN_EVENT_INFO_TYPE_DFID_NAME):
-+            return None
-+        fh_off = 4 + 8                  # skip header(4) + fsid(8)
-+        handle_bytes, _htype = struct.unpack_from("<Ii", rec, fh_off)
-+        blob = rec[fh_off:fh_off + 8 + handle_bytes]   # file_handle struct bytes
-+        name = None
-+        if itype == FAN_EVENT_INFO_TYPE_DFID_NAME:
-+            name_off = fh_off + 8 + handle_bytes
-+            name = rec[name_off:].split(b"\x00", 1)[0].decode("utf-8",
-+                                                              "surrogateescape")
-+        kind = "file" if itype == FAN_EVENT_INFO_TYPE_FID else "dir"
-+        return kind, blob, name
-+
-+    def _resolve(self, data: bytes, start: int, end: int):
-+        """Walk info records of one event; return (path, name_was_present)."""
-+        dir_blob = file_blob = name = None
-+        off = start
-+        while off + 4 <= end:
-+            _it, _pad, ilen = struct.unpack_from("<BBH", data, off)
-+            if ilen == 0:
-+                break
-+            parsed = self._parse_info(data[off:off + ilen])
-+            if parsed:
-+                kind, blob, nm = parsed
-+                if kind == "dir":
-+                    dir_blob = blob
-+                    if nm is not None:
-+                        name = nm
-+                else:
-+                    file_blob = blob
-+            off += ilen
-+
-+        if dir_blob is not None and name is not None:
-+            d = self._path_from_handle(dir_blob)
-+            return (d + "/" + name) if d else None
-+        if file_blob is not None:
-+            return self._path_from_handle(file_blob)
-+        if dir_blob is not None:
-+            return self._path_from_handle(dir_blob)
-+        return None
-+
-+    # ---- the event stream ------------------------------------------------ #
-+    def events(self, stop_flag, poll_ms: int = 500):
-+        """Yield (path, mask) for each event until stop_flag() is true.
-+
-+        Yields (None, FAN_Q_OVERFLOW) when the kernel queue overflowed so the
-+        caller can react (log / trigger a rescan).
-+        """
-+        poller = select.poll()
-+        poller.register(self.fd, select.POLLIN)
-+        while not stop_flag():
-+            if not poller.poll(poll_ms):
-+                continue
-+            try:
-+                data = os.read(self.fd, 1 << 20)
-+            except BlockingIOError:
-+                continue
-+            except OSError:
-+                continue
-+
-+            off = 0
-+            n = len(data)
-+            while off + _META_LEN <= n:
-+                event_len, vers, _res, meta_len, mask, efd, _pid = \
-+                    _META.unpack_from(data, off)
-+                if vers != _FANOTIFY_METADATA_VERSION or event_len < _META_LEN:
-+                    break
-+                end = off + event_len
-+
-+                if mask & FAN_Q_OVERFLOW:
-+                    yield None, FAN_Q_OVERFLOW
-+                elif not (mask & FAN_ONDIR):          # ignore directory events
-+                    path = self._resolve(data, off + meta_len, end)
-+                    if path is not None:
-+                        yield path, mask
-+
-+                if efd >= 0:                           # defensive; FID mode => FAN_NOFD
-+                    try:
-+                        os.close(efd)
-+                    except OSError:
-+                        pass
-+                off = end
 diff --git a/detector/fanotify_watcher.py b/detector/fanotify_watcher.py
 new file mode 100644
-index 0000000..b0845ab
+index 0000000..35db54e
 --- /dev/null
 +++ b/detector/fanotify_watcher.py
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,223 @@
 +"""
 +FanotifyWatcher — the PRIMARY change source on Linux.
 +
@@ -487,8 +255,9 @@ index 0000000..b0845ab
 +
 +
 +class FanotifyWatcher:
-+    def __init__(self, root: str, callback, stop_event):
-+        self.root = root
++    def __init__(self, roots, callback, stop_event):
++        # `roots` is one path or a list of paths — one per filesystem to watch.
++        self.roots = [roots] if isinstance(roots, str) else list(roots)
 +        self.callback = callback        # callback(path, reason, size, mtime_ns, is_exec)
 +        self.stop = stop_event
 +
@@ -499,18 +268,25 @@ index 0000000..b0845ab
 +            err = ctypes.get_errno()
 +            raise OSError(err, f"fanotify_init failed: {os.strerror(err)}")
 +
-+        # One mark covers the whole filesystem that SEED_TREE lives on.
-+        rc = _libc.fanotify_mark(self.fan_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-+                                 WATCH_MASK, AT_FDCWD, root.encode())
-+        if rc < 0:
-+            err = ctypes.get_errno()
++        # A fanotify FILESYSTEM mark covers ONE superblock, so each separately
++        # mounted disk needs its own mark — but all on this single fanotify
++        # handle, so every disk's events share one queue and one pipeline (one
++        # service, not one-per-disk). We also keep one fd per watched root as a
++        # mount reference for open_by_handle_at(); _resolve() tries them until
++        # the handle resolves, which is how path resolution works across disks.
++        self.mount_fds = []
++        for root in self.roots:
++            rc = _libc.fanotify_mark(self.fan_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
++                                     WATCH_MASK, AT_FDCWD, root.encode())
++            if rc < 0:
++                err = ctypes.get_errno()
++                _log(f"WARNING: cannot mark {root}: {os.strerror(err)} (skipped)")
++                continue
++            self.mount_fds.append(os.open(root, os.O_RDONLY))
++        if not self.mount_fds:
 +            os.close(self.fan_fd)
-+            raise OSError(err, f"fanotify_mark failed: {os.strerror(err)}")
-+
-+        # Any fd on the same filesystem works as the mount reference for
-+        # open_by_handle_at(); the tree root is the natural choice.
-+        self.mount_fd = os.open(root, os.O_RDONLY)
-+        _log(f"watching filesystem at {root} (one mark, whole tree)")
++            raise OSError("fanotify_mark failed for every watched root")
++        _log(f"watching {len(self.mount_fds)} filesystem(s): {', '.join(self.roots)}")
 +
 +    # ------------------------------------------------------------------ #
 +    def run(self) -> None:
@@ -522,7 +298,7 @@ index 0000000..b0845ab
 +                data = os.read(self.fan_fd, 1 << 20)   # read many events at once
 +                self._handle_buffer(data)
 +        finally:
-+            for fd in (self.fan_fd, self.mount_fd):
++            for fd in [self.fan_fd, *self.mount_fds]:
 +                try:
 +                    os.close(fd)
 +                except OSError:
@@ -576,17 +352,24 @@ index 0000000..b0845ab
 +        return dir_path, name
 +
 +    def _resolve(self, fh_bytes: bytes):
-+        """Turn a file handle into a path via open_by_handle_at + /proc/self/fd."""
++        """Turn a file handle into a path via open_by_handle_at + /proc/self/fd.
++
++        A handle only resolves against a mount fd on its OWN filesystem, so with
++        several watched disks we try each until one works (EINVAL/ESTALE on the
++        others). For a handful of mounts this is cheap and avoids fsid bookkeeping.
++        """
 +        buf = ctypes.create_string_buffer(fh_bytes, len(fh_bytes))
-+        fd = _libc.open_by_handle_at(self.mount_fd, buf, O_PATH)
-+        if fd < 0:
-+            return None                       # ESTALE: object already gone
-+        try:
-+            return os.readlink(f"/proc/self/fd/{fd}")
-+        except OSError:
-+            return None
-+        finally:
-+            os.close(fd)
++        for mount_fd in self.mount_fds:
++            fd = _libc.open_by_handle_at(mount_fd, buf, O_PATH)
++            if fd < 0:
++                continue                      # not this fs (or object gone) — try next
++            try:
++                return os.readlink(f"/proc/self/fd/{fd}")
++            except OSError:
++                return None
++            finally:
++                os.close(fd)
++        return None
 +
 +    def _emit(self, path: str, mask: int) -> None:
 +        try:
@@ -599,10 +382,10 @@ index 0000000..b0845ab
 +        self.callback(path, _reason_for(mask), st.st_size, st.st_mtime_ns, is_exec)
 diff --git a/detector/poll_watcher.py b/detector/poll_watcher.py
 new file mode 100644
-index 0000000..f3e571c
+index 0000000..1fac8e2
 --- /dev/null
 +++ b/detector/poll_watcher.py
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,61 @@
 +"""
 +PollWatcher — the FALLBACK change source.
 +
@@ -628,36 +411,38 @@ index 0000000..f3e571c
 +
 +
 +class PollWatcher:
-+    def __init__(self, root: str, callback, stop_event, interval: float = 1.0):
-+        self.root = root
++    def __init__(self, roots, callback, stop_event, interval: float = 1.0):
++        # `roots` is one path or a list of paths (same as the fanotify watcher).
++        self.roots = [roots] if isinstance(roots, str) else list(roots)
 +        self.callback = callback      # callback(path, reason, size, mtime_ns, is_exec)
 +        self.stop = stop_event
 +        self.interval = interval
 +
 +    def run(self) -> None:
-+        _log(f"polling {self.root} every {self.interval}s (fanotify unavailable)")
++        _log(f"polling {', '.join(self.roots)} every {self.interval}s (fanotify unavailable)")
 +        baseline = {}                 # path -> signature
 +        first_pass = True             # record the existing tree silently, don't scan it
 +        while not self.stop.is_set():
 +            seen = set()
-+            for dirpath, _dirs, files in os.walk(self.root):
-+                for name in files:
-+                    path = os.path.join(dirpath, name)
-+                    try:
-+                        st = os.stat(path)
-+                    except OSError:
-+                        continue
-+                    if not stat.S_ISREG(st.st_mode):
-+                        continue
-+                    seen.add(path)
-+                    is_exec = bool(st.st_mode & 0o111)
-+                    sig = (st.st_size, st.st_mtime_ns, is_exec)
-+                    old = baseline.get(path)
-+                    if old != sig:
-+                        baseline[path] = sig
-+                        if not first_pass:
-+                            reason = "created" if old is None else "modified"
-+                            self.callback(path, reason, st.st_size, st.st_mtime_ns, is_exec)
++            for root in self.roots:
++                for dirpath, _dirs, files in os.walk(root):
++                    for name in files:
++                        path = os.path.join(dirpath, name)
++                        try:
++                            st = os.stat(path)
++                        except OSError:
++                            continue
++                        if not stat.S_ISREG(st.st_mode):
++                            continue
++                        seen.add(path)
++                        is_exec = bool(st.st_mode & 0o111)
++                        sig = (st.st_size, st.st_mtime_ns, is_exec)
++                        old = baseline.get(path)
++                        if old != sig:
++                            baseline[path] = sig
++                            if not first_pass:
++                                reason = "created" if old is None else "modified"
++                                self.callback(path, reason, st.st_size, st.st_mtime_ns, is_exec)
 +            for gone in set(baseline) - seen:   # forget deleted files
 +                del baseline[gone]
 +            first_pass = False
@@ -820,109 +605,6 @@ index 0000000..7157a10
 +                continue
 +            return msg
 +        return None
-diff --git a/detector/watchset.py b/detector/watchset.py
-new file mode 100644
-index 0000000..1682944
---- /dev/null
-+++ b/detector/watchset.py
-@@ -0,0 +1,97 @@
-+"""
-+watchset.py — the policy layer: *which* changes are worth scanning, and how we
-+tell a MEANINGFUL change apart from noise.
-+
-+Pure and dependency-free: no Linux-specific calls live here, so this module is
-+unit-testable on any OS (macOS included). The fanotify producer and the sender
-+both lean on these helpers.
-+
-+Policy (from the Product Owner):
-+  Relevant  : *.php *.phtml *.php5 *.phar *.inc, *.htaccess (pattern, not just the
-+              literal name), *.js *.html *.htm, and ANY file that gains +x.
-+  Noise     : *.log *.tmp *.swp *~ and editor locks, media (*.jpg *.png *.css ...),
-+              and anything under cache/session trees.
-+  Meaningful: a change counts only if the file's CONTENT changed (size/mtime) or
-+              it GAINED execute permission. atime / ownership / non-exec mode
-+              changes are NOT meaningful and must not trigger a scan.
-+"""
-+from __future__ import annotations
-+
-+import fnmatch
-+
-+# Names that can carry server-side code -> relevant on name alone.
-+RELEVANT_GLOBS = (
-+    "*.php", "*.phtml", "*.php5", "*.phar", "*.inc",
-+    "*.htaccess",                       # a pattern: inj_000061.htaccess counts too
-+    "*.js", "*.html", "*.htm",
-+)
-+
-+# Obvious noise -> never relevant on name alone (exec bit can still override, below).
-+NOISE_GLOBS = (
-+    "*.log", "*.tmp", "*.swp", "*.swx", "*.swpx", "*~",
-+    ".*.swp",                           # vim lock files like .foo.php.swp
-+    "*.jpg", "*.jpeg", "*.png", "*.gif", "*.ico", "*.css",
-+)
-+
-+# Directory path fragments to exclude wholesale (high-churn, non-code).
-+EXCLUDE_DIR_FRAGMENTS = (
-+    "/wp-content/cache/",
-+    "/cache/",
-+    "/sessions/",
-+    "/.git/",
-+    "/node_modules/",
-+)
-+
-+
-+def _basename(path: str) -> str:
-+    return path.rsplit("/", 1)[-1]
-+
-+
-+def is_excluded_dir(path: str) -> bool:
-+    return any(frag in path for frag in EXCLUDE_DIR_FRAGMENTS)
-+
-+
-+def name_is_noise(path: str) -> bool:
-+    name = _basename(path)
-+    return any(fnmatch.fnmatch(name, g) for g in NOISE_GLOBS)
-+
-+
-+def name_is_relevant(path: str) -> bool:
-+    name = _basename(path)
-+    return any(fnmatch.fnmatch(name, g) for g in RELEVANT_GLOBS)
-+
-+
-+def has_exec_bit(mode: int) -> bool:
-+    return bool(mode & 0o111)
-+
-+
-+def is_candidate(path: str, mode: int) -> bool:
-+    """Cheap pre-filter from path + current mode — no content read.
-+
-+    True if this file could ever be in scope:
-+      * not in an excluded directory, AND
-+      * either it currently has +x (any executable file is suspicious,
-+        regardless of extension), OR its name matches a code pattern and is
-+        not obvious noise.
-+    """
-+    if is_excluded_dir(path):
-+        return False
-+    if has_exec_bit(mode):
-+        return True                     # exec bit trumps name/extension
-+    if name_is_noise(path):
-+        return False
-+    return name_is_relevant(path)
-+
-+
-+def fingerprint(st) -> tuple:
-+    """A value that changes ONLY on a meaningful change.
-+
-+    Content change  -> st_size and/or st_mtime_ns move.
-+    Gained/lost +x  -> has_exec_bit flips.
-+    atime           -> ignored (not in the tuple).
-+    ownership/gid   -> ignored.
-+    chmod 644->600  -> ignored (exec bit unchanged).
-+
-+    Takes an os.stat_result.
-+    """
-+    return (st.st_size, st.st_mtime_ns, has_exec_bit(st.st_mode))
 diff --git a/detector/work_queue.py b/detector/work_queue.py
 new file mode 100644
 index 0000000..c74faa9
@@ -1154,148 +836,3 @@ index 0000000..c74faa9
 +            return None
 +        soonest = min(release for _, release in self._deferred.values())
 +        return max(0.0, min(1.0, soonest - time.monotonic()))
-diff --git a/detector/workqueue.py b/detector/workqueue.py
-new file mode 100644
-index 0000000..e9bb2b9
---- /dev/null
-+++ b/detector/workqueue.py
-@@ -0,0 +1,139 @@
-+"""
-+workqueue.py — the single to-do list that sits between the fast kernel side and
-+the slow scanner side. This one object encodes dedup, debounce, and retry.
-+
-+It is a priority queue ordered by a `not_before` timestamp, plus three maps:
-+
-+  _pending   : paths currently in the heap OR in-flight (sent, not yet acked).
-+               Membership here is how we COALESCE — a second event for a path
-+               that is already queued is dropped.
-+  _last_fp   : path -> fingerprint we last successfully delivered. Used to drop
-+               NON-MEANINGFUL changes (same content + same exec bit).
-+  _last_sent : path -> monotonic time we last delivered. Used for DEBOUNCE.
-+
-+Debounce is implemented as *defer, not drop*: a real change that lands inside
-+the cooldown window is scheduled (via not_before) to send when the window ends,
-+so a lone change is never lost — it is at most delayed by the window.
-+
-+Thread-safe: a single Condition guards all state. One or more producer threads
-+call offer(); one consumer thread calls take()/ack()/requeue().
-+"""
-+from __future__ import annotations
-+
-+import heapq
-+import threading
-+import time
-+
-+
-+class WorkQueue:
-+    def __init__(self, debounce_s: float, max_pending: int = 500_000):
-+        self._debounce = debounce_s
-+        self._max_pending = max_pending
-+
-+        self._heap: list = []           # (not_before_mono, seq, path, observed_at, was_move)
-+        self._seq = 0
-+        self._pending: set[str] = set()
-+        self._last_fp: dict[str, tuple] = {}
-+        self._last_sent: dict[str, float] = {}
-+
-+        self._cv = threading.Condition()
-+        self._stopped = False
-+
-+        self.stats = dict(offered=0, coalesced=0, nochange=0, debounced=0,
-+                          enqueued=0, dropped_full=0, delivered=0, busy=0)
-+
-+    # ----- producer side ------------------------------------------------- #
-+    def offer(self, path: str, fp: tuple, observed_at: float, was_move: bool) -> None:
-+        now = time.monotonic()
-+        with self._cv:
-+            self.stats["offered"] += 1
-+
-+            if path in self._pending:                 # already queued/in-flight
-+                self.stats["coalesced"] += 1
-+                return
-+            if self._last_fp.get(path) == fp:         # no meaningful change
-+                self.stats["nochange"] += 1
-+                return
-+            if len(self._pending) >= self._max_pending:
-+                self.stats["dropped_full"] += 1       # last-resort backstop; see rationale
-+                return
-+
-+            not_before = now
-+            last = self._last_sent.get(path)
-+            if last is not None and (now - last) < self._debounce:
-+                not_before = last + self._debounce    # defer to end of cooldown
-+                self.stats["debounced"] += 1
-+
-+            self._seq += 1
-+            heapq.heappush(self._heap,
-+                           (not_before, self._seq, path, observed_at, was_move))
-+            self._pending.add(path)
-+            self.stats["enqueued"] += 1
-+            self._cv.notify()
-+
-+    # ----- consumer side ------------------------------------------------- #
-+    def take(self):
-+        """Block until the earliest item is due; return it, or None if stopped.
-+
-+        The returned path STAYS in _pending (it is now in-flight) until ack()
-+        or drop() is called.
-+        """
-+        with self._cv:
-+            while not self._stopped:
-+                if not self._heap:
-+                    self._cv.wait()
-+                    continue
-+                not_before = self._heap[0][0]
-+                now = time.monotonic()
-+                if not_before <= now:
-+                    _, _, path, observed_at, was_move = heapq.heappop(self._heap)
-+                    return path, observed_at, was_move
-+                self._cv.wait(timeout=not_before - now)
-+            return None
-+
-+    def ack(self, path: str, fp: tuple) -> None:
-+        """Scanner accepted the job: record delivery, free the path."""
-+        with self._cv:
-+            self._pending.discard(path)
-+            self._last_fp[path] = fp
-+            self._last_sent[path] = time.monotonic()
-+            self.stats["delivered"] += 1
-+
-+    def requeue(self, path: str, observed_at: float, was_move: bool,
-+                delay: float) -> None:
-+        """Put an un-delivered job back (busy / disconnect). Keeps it pending."""
-+        with self._cv:
-+            self._seq += 1
-+            heapq.heappush(self._heap,
-+                           (time.monotonic() + delay, self._seq, path,
-+                            observed_at, was_move))
-+            self._pending.add(path)
-+            self.stats["busy"] += 1
-+            self._cv.notify()
-+
-+    def drop(self, path: str) -> None:
-+        """Abandon a job (file vanished / change reverted / bad_request)."""
-+        with self._cv:
-+            self._pending.discard(path)
-+
-+    # ----- helpers ------------------------------------------------------- #
-+    def last_fp_of(self, path: str):
-+        with self._cv:
-+            return self._last_fp.get(path)
-+
-+    def seen(self, path: str) -> bool:
-+        with self._cv:
-+            return path in self._last_fp
-+
-+    def depth(self) -> int:
-+        with self._cv:
-+            return len(self._heap)
-+
-+    def pending_count(self) -> int:
-+        with self._cv:
-+            return len(self._pending)
-+
-+    def stop(self) -> None:
-+        with self._cv:
-+            self._stopped = True
-+            self._cv.notify_all()

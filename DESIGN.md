@@ -101,6 +101,40 @@ flowchart LR
 - The reader stays deliberately dumb + `FAN_UNLIMITED_QUEUE`, so a burst can't
   overflow the kernel queue and make us miss changes.
 
+### Monitoring multiple disks / filesystems
+
+A fanotify `FAN_MARK_FILESYSTEM` mark covers **one filesystem (one superblock)**.
+Fleet servers often spread document roots across several mounted disks
+(`/home`, `/var/www`, `/data/addon`, …), so we add **one mark per filesystem** —
+all on the **same** fanotify handle, so every disk's events share one queue, one
+dedup, and one backpressure loop. **One service per server, not one per disk.**
+
+```mermaid
+flowchart TB
+    subgraph One["single detector process"]
+        FD["one fanotify handle"]
+        FD --> M1["mark: /home (disk A)"]
+        FD --> M2["mark: /var/www (disk B)"]
+        FD --> M3["mark: /data/addon (disk C)"]
+        FD --> QQ[("one WorkQueue → one scanner client")]
+    end
+    A["disk A events"] --> FD
+    B["disk B events"] --> FD
+    C["disk C events"] --> FD
+```
+
+Configure it with `WATCH_ROOTS` (comma-separated); it defaults to `SEED_TREE`:
+
+```bash
+WATCH_ROOTS=/home,/var/www,/data/addon  SCANNER_SOCKET=... ./detector/run.sh
+```
+
+Path resolution works across disks because a file handle only resolves against a
+mount fd **on its own filesystem**: we keep one mount fd per watched root and try
+each until the handle resolves. A mark that fails (e.g. a path that isn't a mount
+point) is logged and skipped; the detector keeps watching the rest. *(Verified on
+two separate filesystems — ext4 + tmpfs — in the container test.)*
+
 ---
 
 ## 3. What counts as a *relevant* change (the watch set)
@@ -429,5 +463,7 @@ producer/consumer structure.
 - Overflow handler logs but doesn't yet auto-rescan; production would trigger a
   targeted rescan of the affected subtree.
 - FID path reporting needs Linux 5.9+; older kernels fall back to polling.
-- Single-filesystem assumption for the `open_by_handle_at` mount fd; multiple
-  mounts need one mark + mount-fd per filesystem.
+- Multiple disks are supported via `WATCH_ROOTS` (one mark + mount-fd per
+  filesystem; see §2). For *very* many filesystems, resolving a handle by trying
+  each mount fd is O(#fs) per event — fine for a handful; map by `fsid` if a host
+  mounts dozens of disks.

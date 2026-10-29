@@ -96,8 +96,9 @@ def _reason_for(mask: int) -> str:
 
 
 class FanotifyWatcher:
-    def __init__(self, root: str, callback, stop_event):
-        self.root = root
+    def __init__(self, roots, callback, stop_event):
+        # `roots` is one path or a list of paths — one per filesystem to watch.
+        self.roots = [roots] if isinstance(roots, str) else list(roots)
         self.callback = callback        # callback(path, reason, size, mtime_ns, is_exec)
         self.stop = stop_event
 
@@ -108,18 +109,25 @@ class FanotifyWatcher:
             err = ctypes.get_errno()
             raise OSError(err, f"fanotify_init failed: {os.strerror(err)}")
 
-        # One mark covers the whole filesystem that SEED_TREE lives on.
-        rc = _libc.fanotify_mark(self.fan_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-                                 WATCH_MASK, AT_FDCWD, root.encode())
-        if rc < 0:
-            err = ctypes.get_errno()
+        # A fanotify FILESYSTEM mark covers ONE superblock, so each separately
+        # mounted disk needs its own mark — but all on this single fanotify
+        # handle, so every disk's events share one queue and one pipeline (one
+        # service, not one-per-disk). We also keep one fd per watched root as a
+        # mount reference for open_by_handle_at(); _resolve() tries them until
+        # the handle resolves, which is how path resolution works across disks.
+        self.mount_fds = []
+        for root in self.roots:
+            rc = _libc.fanotify_mark(self.fan_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                                     WATCH_MASK, AT_FDCWD, root.encode())
+            if rc < 0:
+                err = ctypes.get_errno()
+                _log(f"WARNING: cannot mark {root}: {os.strerror(err)} (skipped)")
+                continue
+            self.mount_fds.append(os.open(root, os.O_RDONLY))
+        if not self.mount_fds:
             os.close(self.fan_fd)
-            raise OSError(err, f"fanotify_mark failed: {os.strerror(err)}")
-
-        # Any fd on the same filesystem works as the mount reference for
-        # open_by_handle_at(); the tree root is the natural choice.
-        self.mount_fd = os.open(root, os.O_RDONLY)
-        _log(f"watching filesystem at {root} (one mark, whole tree)")
+            raise OSError("fanotify_mark failed for every watched root")
+        _log(f"watching {len(self.mount_fds)} filesystem(s): {', '.join(self.roots)}")
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
@@ -131,7 +139,7 @@ class FanotifyWatcher:
                 data = os.read(self.fan_fd, 1 << 20)   # read many events at once
                 self._handle_buffer(data)
         finally:
-            for fd in (self.fan_fd, self.mount_fd):
+            for fd in [self.fan_fd, *self.mount_fds]:
                 try:
                     os.close(fd)
                 except OSError:
@@ -185,17 +193,24 @@ class FanotifyWatcher:
         return dir_path, name
 
     def _resolve(self, fh_bytes: bytes):
-        """Turn a file handle into a path via open_by_handle_at + /proc/self/fd."""
+        """Turn a file handle into a path via open_by_handle_at + /proc/self/fd.
+
+        A handle only resolves against a mount fd on its OWN filesystem, so with
+        several watched disks we try each until one works (EINVAL/ESTALE on the
+        others). For a handful of mounts this is cheap and avoids fsid bookkeeping.
+        """
         buf = ctypes.create_string_buffer(fh_bytes, len(fh_bytes))
-        fd = _libc.open_by_handle_at(self.mount_fd, buf, O_PATH)
-        if fd < 0:
-            return None                       # ESTALE: object already gone
-        try:
-            return os.readlink(f"/proc/self/fd/{fd}")
-        except OSError:
-            return None
-        finally:
-            os.close(fd)
+        for mount_fd in self.mount_fds:
+            fd = _libc.open_by_handle_at(mount_fd, buf, O_PATH)
+            if fd < 0:
+                continue                      # not this fs (or object gone) — try next
+            try:
+                return os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                return None
+            finally:
+                os.close(fd)
+        return None
 
     def _emit(self, path: str, mask: int) -> None:
         try:

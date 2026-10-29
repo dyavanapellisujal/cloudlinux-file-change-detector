@@ -97,17 +97,35 @@ isn't "silently lost").
 signature-based "meaningful change" dedup; coalesce + cooldown; the exponential
 backoff shape; reconnect-and-replay; `FAN_UNLIMITED_QUEUE` / overflow awareness;
 the producer/consumer structure.
-**Rejected / changed:**
-- It first shipped an **in-memory-only** queue (a detector crash would lose the
-  backlog). I required **SQLite durability now**, not as "future work."
-- It proposed a **2s** cooldown; I set **5s** after working through the PO's
-  "meaningful change" definition, and kept it **signature-gated** so metadata-only
-  noise never consumes a scan.
-- It validated on **macOS via the polling fallback**; I insisted on testing on a
-  **real Linux kernel in a container**, since fanotify is the actual deliverable.
-- It started leaning on its own scaffolding; I required the **provided
-  scanner/seed/load fixtures to be used as-is** and to drive/observe the pipeline
-  myself.
+**Rejected / changed — design tradeoffs where its first answer was weaker:**
+- **Durability: in-memory → disk-backed.** It modelled the queue as **in-memory
+  only** and filed persistence as "future work," which quietly trades away
+  never-lose the moment the *detector itself* crashes (OOM-kill, deploy, panic). I
+  made it **SQLite (WAL) now**. The tradeoff I accepted: a small write on the hot
+  path in exchange for a backlog that survives a process restart — the right side
+  for a never-lose security tool.
+- **Dedup identity: time-window → meaningful-change signature.** Its first dedup
+  was a **pure time debounce** — "seen this path recently, skip it" — which both
+  rescans on metadata-only noise (chown/atime) *and* can skip a real edit that
+  happens to fall in the window. I changed the dedup key to a **content signature
+  `(size, mtime, +x)`**: a chown/atime change collapses (no wasted scan), but any
+  new content or new execute bit is a different signature and always goes through.
+  Tradeoff: a tiny bit of per-event `stat` work for correct "did it *meaningfully*
+  change" semantics.
+- **Cooldown must defer, not drop.** Its cooldown would have **suppressed** repeat
+  changes inside the window (simplest), which can silently bury the one change that
+  matters if a file is rewritten maliciously right after a scan and then goes
+  quiet. I made the cooldown **hold the latest version and release it** when the
+  window ends — so a same-file change is delayed at most 5s, **never lost**.
+  Tradeoff: up to 5s added detection latency on a re-scan, chosen over any risk of
+  a miss. (We also tuned the window itself: its **2s** → **5s**, balancing
+  duplicate-scan pressure against that latency.)
+- **Never-lose at the kernel boundary.** It relied on the default (bounded) kernel
+  event queue, where a 50k-file burst can overflow and drop events **invisibly** —
+  a silent-loss hole. I required `FAN_UNLIMITED_QUEUE` plus explicit
+  `FAN_Q_OVERFLOW` detection, so the boundary either keeps every event or says so
+  loudly (triggering a rescan), never fails quietly. Tradeoff: unbounded kernel
+  memory for the queue vs. guaranteed completeness — again the never-lose side.
 
 ## Requirements mapping
 | Requirement | How it's met |

@@ -69,7 +69,10 @@ flowchart LR
 ```
 
 1. **Detect** — one fanotify filesystem-wide mark catches every create/modify/
-   move/chmod across all accounts (scales where inotify can't).
+   move/chmod across all accounts (scales where inotify can't). Spans **multiple
+   mounted disks** via `WATCH_ROOTS=/home,/var/www,/data` — one mark per
+   filesystem, one service — see
+   [DESIGN.md: multiple disks](DESIGN.md#monitoring-multiple-disks--filesystems).
 2. **Filter** — keep only `*.php/.phtml/.php5/.phar/.inc`, `*.htaccess`,
    `*.js/.html/.htm`, and **any file that gains `+x`**; drop media, temp, cache.
 3. **Dedup** — a job's identity is `(size, mtime, +x)`; same signature = no

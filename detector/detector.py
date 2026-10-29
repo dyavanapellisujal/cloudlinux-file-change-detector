@@ -58,17 +58,17 @@ def is_relevant(path: str, is_exec: bool) -> bool:
 # --------------------------------------------------------------------------- #
 #  Wiring
 # --------------------------------------------------------------------------- #
-def make_watcher(seed_tree, on_change, stop):
+def make_watcher(roots, on_change, stop):
     """fanotify on Linux if we can set it up; otherwise the polling fallback."""
     if sys.platform.startswith("linux"):
         try:
             from fanotify_watcher import FanotifyWatcher
-            return FanotifyWatcher(seed_tree, on_change, stop)
+            return FanotifyWatcher(roots, on_change, stop)
         except Exception as e:                # not root, old kernel, etc.
             print(f"[detector] fanotify unavailable ({e}); using polling fallback",
                   file=sys.stderr, flush=True)
     from poll_watcher import PollWatcher
-    return PollWatcher(seed_tree, on_change, stop)
+    return PollWatcher(roots, on_change, stop)
 
 
 def main() -> int:
@@ -77,6 +77,13 @@ def main() -> int:
     if not seed_tree or not socket_path:
         print("SEED_TREE and SCANNER_SOCKET must be set", file=sys.stderr)
         return 2
+
+    # Watch one tree by default (SEED_TREE), or several filesystems/disks via
+    # WATCH_ROOTS="/home,/var/www,/data" — one fanotify mark per filesystem,
+    # all feeding this one detector. See DESIGN.md "Monitoring multiple disks".
+    roots = [r.strip() for r in os.environ.get("WATCH_ROOTS", "").split(",") if r.strip()]
+    if not roots:
+        roots = [seed_tree]
 
     # Durable queue so a detector restart doesn't drop a backlog. Override the
     # location with DETECTOR_DB; set it empty to run purely in-memory.
@@ -95,7 +102,7 @@ def main() -> int:
             queue.offer(Job(path, reason, size, mtime_ns, is_exec, time.time()))
 
     verbose = os.environ.get("DETECTOR_VERBOSE", "") not in ("", "0", "false")
-    watcher = make_watcher(seed_tree, on_change, stop)
+    watcher = make_watcher(roots, on_change, stop)
     client = ScannerClient(socket_path, queue, stop, verbose=verbose)
 
     def shutdown(*_):
